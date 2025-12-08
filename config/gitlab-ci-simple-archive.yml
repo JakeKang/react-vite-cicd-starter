@@ -1,0 +1,359 @@
+# GitLab CI/CD Pipeline for React Monorepo
+# 최신 패턴: Turborepo Remote Caching + Docker BuildKit + 간소화된 아카이빙
+
+# 전역 변수 정의
+variables:
+  # Docker 관련
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+  
+  # Node.js 버전 고정 (LTS 권장)
+  NODE_VERSION: "20"
+  
+  # Turborepo 원격 캐싱 (선택사항)
+  TURBO_TOKEN: $TURBO_TOKEN
+  TURBO_TEAM: $TURBO_TEAM
+  
+  # 배포 대상 서버
+  DEV_SERVER_HOST: $DEV_SERVER_HOST
+  DEV_SERVER_USER: $DEV_SERVER_USER
+
+# 캐시 전략: package-lock.json 기반 + Turborepo 캐시
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - node_modules/
+    - .turbo/
+    - apps/*/node_modules/
+    - packages/*/node_modules/
+
+# 스테이지 정의
+stages:
+  - prepare      # 의존성 설치 및 준비
+  - validate     # 린트, 타입 체크, 테스트
+  - build        # 프로덕션 빌드
+  - package      # Docker 이미지 생성
+  - deploy       # 개발 서버 배포
+  - archive      # 빌드 아티팩트 아카이빙
+
+# =====================================
+# Stage 1: 준비
+# =====================================
+install_dependencies:
+  stage: prepare
+  image: node:${NODE_VERSION}-alpine
+  script:
+    - echo "📦 Installing dependencies..."
+    - npm ci --prefer-offline --no-audit
+    - echo "✅ Dependencies installed"
+  artifacts:
+    paths:
+      - node_modules/
+      - apps/*/node_modules/
+      - packages/*/node_modules/
+    expire_in: 1 hour
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 2: 검증 (병렬 실행)
+# =====================================
+lint:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🔍 Running ESLint..."
+    - npx turbo run lint
+  allow_failure: false
+  only:
+    - merge_requests
+    - main
+    - develop
+
+type_check:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🔍 Type checking..."
+    - npx turbo run type-check
+  allow_failure: false
+  only:
+    - merge_requests
+    - main
+    - develop
+
+test:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🧪 Running tests..."
+    - npx turbo run test -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 3: 빌드 (병렬 실행)
+# =====================================
+build_all_apps:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies", "lint", "type_check", "test"]
+  script:
+    - echo "🏗️ Building all apps with Turborepo..."
+    - npx turbo run build --filter='./apps/*'
+  artifacts:
+    paths:
+      - apps/*/dist/
+    expire_in: 1 day
+  only:
+    - main
+    - develop
+
+# =====================================
+# Stage 4: Docker 이미지 생성
+# =====================================
+docker_build:
+  stage: package
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs: ["build_all_apps"]
+  before_script:
+    - docker info
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "🐳 Building Docker images..."
+    - |
+      for app in apps/*/; do
+        app_name=$(basename "$app")
+        echo "Building $app_name..."
+        docker build \
+          --build-arg APP_NAME=$app_name \
+          --cache-from $CI_REGISTRY_IMAGE/$app_name:latest \
+          --tag $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA \
+          --tag $CI_REGISTRY_IMAGE/$app_name:latest \
+          --file docker/Dockerfile.app \
+          .
+        docker push $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA
+        docker push $CI_REGISTRY_IMAGE/$app_name:latest
+      done
+  only:
+    - main
+    - develop
+
+# =====================================
+# Stage 5: 개발 서버 배포
+# =====================================
+deploy_to_dev:
+  stage: deploy
+  image: alpine:latest
+  needs: ["docker_build"]
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $DEV_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    - echo "🚀 Deploying to development server..."
+    - |
+      ssh $DEV_SERVER_USER@$DEV_SERVER_HOST << 'ENDSSH'
+        cd /opt/my-monorepo
+        docker compose pull
+        docker compose up -d --remove-orphans
+        docker image prune -af --filter "until=24h"
+      ENDSSH
+    - echo "✅ Deployment completed"
+  environment:
+    name: development
+    url: https://dev.yourcompany.com
+  only:
+    - develop
+
+# =====================================
+# Stage 6: 아티팩트 아카이빙 (간소화)
+# =====================================
+archive_build:
+  stage: archive
+  image: alpine:latest
+  needs: ["build_all_apps"]
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - echo "📦 Archiving commit information..."
+    
+    # 아티팩트 디렉토리 생성
+    - mkdir -p build-artifacts/$CI_COMMIT_REF_NAME
+    
+    # =====================================
+    # 방법 1: 커밋 URL만 텍스트 파일로 저장 (가장 간단)
+    # =====================================
+    - |
+      cat > build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt << EOF
+      ===============================================
+      Build Artifact - Pipeline #${CI_PIPELINE_ID}
+      ===============================================
+      
+      브랜치: ${CI_COMMIT_REF_NAME}
+      커밋 SHA: ${CI_COMMIT_SHA}
+      커밋 작성자: $(git log -1 --pretty=format:'%an <%ae>')
+      커밋 날짜: $(git log -1 --pretty=format:'%ci')
+      커밋 메시지: $(git log -1 --pretty=format:'%s')
+      
+      ===============================================
+      GitLab 커밋 페이지 (우클릭 > 다른 이름으로 저장)
+      ===============================================
+      ${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}
+      
+      ===============================================
+      빌드된 앱 목록
+      ===============================================
+      EOF
+    
+    # 빌드된 앱 목록 추가
+    - |
+      for app in apps/*/; do
+        app_name=$(basename "$app")
+        echo "- $app_name" >> build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt
+      done
+    
+    - |
+      cat >> build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt << EOF
+      
+      ===============================================
+      사용 방법
+      ===============================================
+      1. 위의 GitLab 커밋 페이지 URL을 브라우저에서 열기
+      2. 마우스 우클릭 > "다른 이름으로 저장" 클릭
+      3. HTML 파일로 저장됨 (GitLab 기본 스타일 포함)
+      
+      또는 wget으로 다운로드:
+      wget -O commit-${CI_COMMIT_SHA}.html "${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}"
+      
+      ===============================================
+      빌드 정보
+      ===============================================
+      Docker 이미지: ${CI_REGISTRY_IMAGE}/*:${CI_COMMIT_SHA}
+      파이프라인 URL: ${CI_PIPELINE_URL}
+      생성 시간: $(date)
+      EOF
+    
+    - echo "✅ Commit information saved to build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt"
+    
+    # =====================================
+    # 방법 2: wget으로 GitLab 커밋 페이지를 HTML로 자동 저장 (선택사항)
+    # =====================================
+    - |
+      if [ -n "$GITLAB_TOKEN" ]; then
+        echo "📥 Downloading GitLab commit page as HTML..."
+        
+        # 파일명: YYYYMMDD-HHMM-커밋메시지-해시.html
+        COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y%m%d-%H%M' ${CI_COMMIT_SHA})
+        COMMIT_MSG=$(git log -1 --format=%s ${CI_COMMIT_SHA} | sed 's/[^a-zA-Z0-9가-힣]/-/g' | cut -c1-50)
+        COMMIT_SHORT=$(echo ${CI_COMMIT_SHA} | cut -c1-8)
+        FILENAME="${COMMIT_DATE}-${COMMIT_MSG}-${COMMIT_SHORT}.html"
+        
+        echo "Saving as: $FILENAME"
+        
+        wget --header="PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+             --header="Accept: text/html" \
+             --timeout=30 \
+             --tries=3 \
+             -O "build-artifacts/$CI_COMMIT_REF_NAME/${FILENAME}" \
+             "${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}" \
+             && echo "✅ HTML saved: ${FILENAME}" \
+             || echo "⚠️ Failed to download HTML (인증 필요 또는 권한 부족)"
+      else
+        echo "ℹ️ GITLAB_TOKEN not set, skipping automatic HTML download"
+        echo "   수동으로 다운로드하려면 위의 URL을 브라우저에서 열고 '다른 이름으로 저장'하세요"
+      fi
+    
+    # =====================================
+    # 클라우드 업로드 (선택사항)
+    # =====================================
+    - |
+      if [ -n "$RCLONE_CONFIG" ]; then
+        echo "☁️ Uploading to cloud storage..."
+        echo "$RCLONE_CONFIG" > ~/.rclone.conf
+        apk add --no-cache rclone
+        rclone copy build-artifacts/ remote:build-artifacts/ -v \
+          || echo "⚠️ Cloud upload failed, but artifacts are saved in GitLab"
+      else
+        echo "ℹ️ RCLONE_CONFIG not set, skipping cloud upload"
+      fi
+  
+  artifacts:
+    paths:
+      - build-artifacts/
+    expire_in: 90 days
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# =====================================
+# 선택: 수동 HTML 다운로드 Job
+# =====================================
+download_commit_html:
+  stage: archive
+  image: alpine:latest
+  needs: ["build_all_apps"]
+  before_script:
+    - apk add --no-cache curl git
+  script:
+    - echo "📥 Downloading GitLab commit page..."
+    - mkdir -p commit-htmls
+    - |
+      # GITLAB_TOKEN이 있으면 자동 다운로드
+      if [ -n "$GITLAB_TOKEN" ]; then
+        # 파일명: YYYYMMDD-HHMM-커밋메시지-해시.html
+        COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y%m%d-%H%M' ${CI_COMMIT_SHA})
+        COMMIT_MSG=$(git log -1 --format=%s ${CI_COMMIT_SHA} | sed 's/[^a-zA-Z0-9가-힣]/-/g' | cut -c1-50)
+        COMMIT_SHORT=$(echo ${CI_COMMIT_SHA} | cut -c1-8)
+        FILENAME="${COMMIT_DATE}-${COMMIT_MSG}-${COMMIT_SHORT}.html"
+        
+        echo "Saving as: $FILENAME"
+        
+        curl -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+             -H "Accept: text/html" \
+             --connect-timeout 30 \
+             --max-time 60 \
+             -o "commit-htmls/${FILENAME}" \
+             "${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}" \
+             && echo "✅ HTML downloaded: ${FILENAME}" \
+             || echo "⚠️ Download failed"
+      else
+        echo "⚠️ GITLAB_TOKEN not set"
+        echo "수동 다운로드 방법:"
+        echo "1. 브라우저에서 다음 URL 열기:"
+        echo "   ${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}"
+        echo "2. 우클릭 > '다른 이름으로 저장'"
+      fi
+  artifacts:
+    paths:
+      - commit-htmls/
+    expire_in: 90 days
+  when: manual  # 수동 실행
+  only:
+    - main
+    - develop

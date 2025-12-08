@@ -1,0 +1,382 @@
+# GitLab CI/CD Pipeline for React Monorepo
+# 최신 패턴: Turborepo Remote Caching + Docker BuildKit + 병렬 Job
+
+# 전역 변수 정의
+variables:
+  # Docker 관련
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+  
+  # Node.js 버전 고정 (LTS 권장)
+  NODE_VERSION: "20"
+  
+  # Turborepo 원격 캐싱 (선택사항 - Vercel Remote Cache 또는 자체 S3)
+  TURBO_TOKEN: $TURBO_TOKEN
+  TURBO_TEAM: $TURBO_TEAM
+  
+  # 배포 대상 서버
+  DEV_SERVER_HOST: $DEV_SERVER_HOST
+  DEV_SERVER_USER: $DEV_SERVER_USER
+  
+  # 아티팩트 저장 경로
+  ARTIFACT_BASE_PATH: "build-artifacts"
+
+# 캐시 전략: package-lock.json 기반 + Turborepo 캐시
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - node_modules/
+    - .turbo/
+    - apps/*/node_modules/
+    - packages/*/node_modules/
+
+# 스테이지 정의: 순차적 파이프라인
+stages:
+  - prepare      # 의존성 설치 및 준비
+  - validate     # 린트, 타입 체크, 테스트
+  - build        # 프로덕션 빌드
+  - package      # Docker 이미지 생성
+  - deploy       # 개발 서버 배포
+  - archive      # 빌드 아티팩트 아카이빙
+
+# =====================================
+# Stage 1: 준비
+# =====================================
+install_dependencies:
+  stage: prepare
+  image: node:${NODE_VERSION}-alpine
+  script:
+    - echo "📦 Installing dependencies with npm ci..."
+    - npm ci --prefer-offline --no-audit
+    - echo "✅ Dependencies installed"
+  artifacts:
+    paths:
+      - node_modules/
+      - apps/*/node_modules/
+      - packages/*/node_modules/
+    expire_in: 1 hour
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 2: 검증 (병렬 실행)
+# =====================================
+lint:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🔍 Running ESLint across all workspaces..."
+    - npx turbo run lint
+  allow_failure: false
+  only:
+    - merge_requests
+    - main
+    - develop
+
+type_check:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🔍 Type checking with TypeScript..."
+    - npx turbo run type-check
+  allow_failure: false
+  only:
+    - merge_requests
+    - main
+    - develop
+
+test:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - echo "🧪 Running tests with coverage..."
+    - npx turbo run test -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 3: 빌드 (병렬 실행)
+# =====================================
+# 변경된 앱만 빌드하도록 동적 처리 (Turborepo의 --filter 활용)
+build_all_apps:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies", "lint", "type_check", "test"]
+  script:
+    - echo "🏗️ Building all apps with Turborepo..."
+    # Turborepo가 변경 감지 및 캐싱 처리
+    - npx turbo run build --filter='./apps/*'
+  artifacts:
+    paths:
+      - apps/*/dist/
+      - apps/*/.next/
+    expire_in: 1 day
+  only:
+    - main
+    - develop
+
+# 개별 앱 빌드 예시 (특정 브랜치나 MR에서만)
+build_feature_a:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies", "lint", "type_check", "test"]
+  script:
+    - echo "🏗️ Building feature-a only..."
+    - npx turbo run build --filter='feature-a'
+  artifacts:
+    paths:
+      - apps/feature-a/dist/
+      - apps/feature-a/.next/
+    expire_in: 1 day
+  only:
+    changes:
+      - apps/feature-a/**/*
+      - packages/**/*
+  except:
+    - main
+
+# =====================================
+# Stage 4: Docker 이미지 생성
+# =====================================
+docker_build:
+  stage: package
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs: ["build_all_apps"]
+  before_script:
+    - docker info
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "🐳 Building Docker images with BuildKit..."
+    # 멀티스테이지 빌드로 최적화된 이미지 생성
+    - |
+      for app in apps/*/; do
+        app_name=$(basename "$app")
+        echo "Building $app_name..."
+        docker build \
+          --build-arg APP_NAME=$app_name \
+          --cache-from $CI_REGISTRY_IMAGE/$app_name:latest \
+          --tag $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA \
+          --tag $CI_REGISTRY_IMAGE/$app_name:latest \
+          --file docker/Dockerfile.app \
+          .
+        docker push $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA
+        docker push $CI_REGISTRY_IMAGE/$app_name:latest
+      done
+  only:
+    - main
+    - develop
+
+# =====================================
+# Stage 5: 개발 서버 배포
+# =====================================
+deploy_to_dev:
+  stage: deploy
+  image: alpine:latest
+  needs: ["docker_build"]
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $DEV_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    - echo "🚀 Deploying to development server..."
+    - |
+      ssh $DEV_SERVER_USER@$DEV_SERVER_HOST << 'ENDSSH'
+        cd /opt/my-monorepo
+        # Docker Compose로 서비스 업데이트
+        docker compose pull
+        docker compose up -d --remove-orphans
+        # 이전 이미지 정리
+        docker image prune -af --filter "until=24h"
+      ENDSSH
+    - echo "✅ Deployment completed"
+  environment:
+    name: development
+    url: https://dev.yourcompany.com
+  only:
+    - develop
+
+deploy_to_prod:
+  stage: deploy
+  image: alpine:latest
+  needs: ["docker_build"]
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $DEV_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    - echo "🚀 Deploying to production server..."
+    - |
+      ssh $DEV_SERVER_USER@$DEV_SERVER_HOST << 'ENDSSH'
+        cd /opt/my-monorepo-prod
+        docker compose pull
+        docker compose up -d --remove-orphans
+        docker image prune -af --filter "until=72h"
+      ENDSSH
+    - echo "✅ Production deployment completed"
+  environment:
+    name: production
+    url: https://yourcompany.com
+  when: manual  # 수동 승인 필요
+  only:
+    - main
+
+# =====================================
+# Stage 6: 아티팩트 아카이빙
+# =====================================
+archive_build:
+  stage: archive
+  image: node:${NODE_VERSION}-alpine
+  needs: ["build_all_apps"]
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - echo "📦 Archiving build artifacts..."
+    # 커밋 정보 추출
+    - export COMMIT_AUTHOR=$(git log -1 --pretty=format:'%an')
+    - export COMMIT_EMAIL=$(git log -1 --pretty=format:'%ae')
+    - export COMMIT_DATE=$(git log -1 --pretty=format:'%ci')
+    - export COMMIT_MESSAGE=$(git log -1 --pretty=format:'%s')
+    - export COMMIT_HASH=$(git rev-parse --short HEAD)
+    
+    # HTML 리포트 생성
+    - mkdir -p $ARTIFACT_BASE_PATH/$CI_COMMIT_REF_NAME
+    - |
+      cat > $ARTIFACT_BASE_PATH/$CI_COMMIT_REF_NAME/build-${CI_PIPELINE_ID}.html << EOF
+      <!DOCTYPE html>
+      <html lang="ko">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Build Report - ${CI_COMMIT_REF_NAME} - ${COMMIT_HASH}</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px; background: #f5f5f5; }
+          .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+          h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+          .info { background: #ecf0f1; padding: 15px; border-radius: 5px; margin: 20px 0; }
+          .info-row { display: flex; margin: 10px 0; }
+          .info-label { font-weight: bold; width: 150px; color: #7f8c8d; }
+          .info-value { flex: 1; color: #2c3e50; }
+          .commit-message { background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; }
+          .apps-list { margin: 20px 0; }
+          .app-item { background: #e8f5e9; padding: 10px; margin: 5px 0; border-radius: 4px; }
+          .timestamp { color: #95a5a6; font-size: 0.9em; margin-top: 20px; text-align: right; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🚀 Build Report</h1>
+          
+          <div class="info">
+            <div class="info-row">
+              <span class="info-label">Branch:</span>
+              <span class="info-value">${CI_COMMIT_REF_NAME}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Commit Hash:</span>
+              <span class="info-value">${COMMIT_HASH}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Author:</span>
+              <span class="info-value">${COMMIT_AUTHOR} &lt;${COMMIT_EMAIL}&gt;</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Date:</span>
+              <span class="info-value">${COMMIT_DATE}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Pipeline ID:</span>
+              <span class="info-value">${CI_PIPELINE_ID}</span>
+            </div>
+          </div>
+          
+          <div class="commit-message">
+            <strong>Commit Message:</strong><br>
+            ${COMMIT_MESSAGE}
+          </div>
+          
+          <h2>Built Applications</h2>
+          <div class="apps-list">
+      EOF
+    
+    # 빌드된 앱 목록 추가
+    - |
+      for app in apps/*/; do
+        app_name=$(basename "$app")
+        echo "<div class=\"app-item\">✅ $app_name</div>" >> $ARTIFACT_BASE_PATH/$CI_COMMIT_REF_NAME/build-${CI_PIPELINE_ID}.html
+      done
+    
+    - |
+      cat >> $ARTIFACT_BASE_PATH/$CI_COMMIT_REF_NAME/build-${CI_PIPELINE_ID}.html << EOF
+          </div>
+          
+          <div class="timestamp">
+            Generated: $(date)
+          </div>
+        </div>
+      </body>
+      </html>
+      EOF
+    
+    - echo "✅ Build report generated"
+    
+    # Google Drive 또는 OneDrive 업로드 (rclone 사용)
+    # 사전에 rclone config를 GitLab CI/CD Variables에 저장 필요
+    - |
+      if [ -n "$RCLONE_CONFIG" ]; then
+        echo "☁️ Uploading to cloud storage..."
+        echo "$RCLONE_CONFIG" > ~/.rclone.conf
+        apk add --no-cache rclone
+        rclone copy $ARTIFACT_BASE_PATH remote:build-artifacts/ -v
+        echo "✅ Uploaded to cloud storage"
+      else
+        echo "⚠️ RCLONE_CONFIG not set, skipping cloud upload"
+      fi
+  artifacts:
+    paths:
+      - $ARTIFACT_BASE_PATH/
+    expire_in: 90 days
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# =====================================
+# 선택: 주기적인 캐시 정리
+# =====================================
+cleanup_cache:
+  stage: prepare
+  image: alpine:latest
+  script:
+    - echo "🧹 Cleaning up old caches..."
+    - find . -name "node_modules" -type d -mtime +7 -exec rm -rf {} +
+    - find .turbo -type f -mtime +7 -delete
+  only:
+    - schedules
+  when: manual

@@ -1,0 +1,65 @@
+# rclone Configuration for Cloud Storage Upload
+# 
+# 설정 방법:
+# 1. 로컬에서 rclone config 실행하여 대화형 설정
+# 2. ~/.config/rclone/rclone.conf 파일 내용을 GitLab CI/CD Variables에 저장
+# 3. Variable 이름: RCLONE_CONFIG
+# 4. CI 파이프라인에서 자동으로 클라우드 업로드 실행
+#
+# 주의: 이 파일은 민감한 정보를 포함하므로 .gitignore에 추가 필수!
+
+# =====================================
+# Google Drive 설정 예시
+# =====================================
+[gdrive]
+type = drive
+# OAuth 토큰은 rclone config 실행 시 자동 생성됨
+# client_id와 client_secret은 Google Cloud Console에서 발급
+client_id = YOUR_GOOGLE_CLIENT_ID
+client_secret = YOUR_GOOGLE_CLIENT_SECRET
+scope = drive
+token = {"access_token":"xxx","token_type":"Bearer","refresh_token":"xxx","expiry":"2024-12-31T23:59:59.999Z"}
+# 공유 드라이브 사용 시
+# team_drive = TEAM_DRIVE_ID
+
+# =====================================
+# OneDrive 설정 예시
+# =====================================
+[onedrive]
+type = onedrive
+# OAuth 토큰은 rclone config 실행 시 자동 생성됨
+client_id = YOUR_ONEDRIVE_CLIENT_ID
+client_secret = YOUR_ONEDRIVE_CLIENT_SECRET
+token = {"access_token":"xxx","token_type":"Bearer","refresh_token":"xxx","expiry":"2024-12-31T23:59:59.999Z"}
+drive_id = YOUR_DRIVE_ID
+drive_type = business
+
+# =====================================
+# AWS S3 설정 예시 (대안)
+# =====================================
+[s3]
+type = s3
+provider = AWS
+access_key_id = YOUR_AWS_ACCESS_KEY_ID
+secret_access_key = YOUR_AWS_SECRET_ACCESS_KEY
+region = ap-northeast-2
+acl = private
+
+# =====================================
+# 실제 CI에서 사용할 명령어 예시
+# =====================================
+# 
+# 1. Google Drive에 업로드:
+# rclone copy build-artifacts/ gdrive:build-artifacts/ -v
+# 
+# 2. OneDrive에 업로드:
+# rclone copy build-artifacts/ onedrive:build-artifacts/ -v
+# 
+# 3. 특정 파일만 업로드:
+# rclone copy build-artifacts/ gdrive:build-artifacts/ --include "*.html" -v
+# 
+# 4. 동기화 (로컬에 없는 파일은 클라우드에서 삭제):
+# rclone sync build-artifacts/ gdrive:build-artifacts/ -v
+# 
+# 5. 업로드 진행 상황 표시:
+# rclone copy build-artifacts/ gdrive:build-artifacts/ -P

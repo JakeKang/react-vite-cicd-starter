@@ -1,0 +1,38 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local"],
+  "pipeline": {
+    // 빌드: 의존성 순서대로 실행 (packages → apps)
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"],
+      "env": ["NODE_ENV"]
+    },
+    // 개발 서버: 의존성 무시하고 병렬 실행
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    // 린트: 독립적으로 병렬 실행
+    "lint": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    // 타입 체크: 독립적으로 병렬 실행
+    "type-check": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    // 테스트: 독립적으로 병렬 실행
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"],
+      "cache": false
+    },
+    // Docker 이미지 빌드
+    "docker:build": {
+      "dependsOn": ["build"],
+      "cache": false
+    }
+  }
+}

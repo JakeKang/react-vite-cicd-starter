@@ -1,0 +1,304 @@
+# GitLab CI/CD Pipeline - Optimized Version
+# 최적화: 병렬 실행 강화 + 조건부 빌드 + 간소화된 아카이빙
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+  NODE_VERSION: "20"
+  TURBO_TOKEN: $TURBO_TOKEN
+  TURBO_TEAM: $TURBO_TEAM
+  DEV_SERVER_HOST: $DEV_SERVER_HOST
+  DEV_SERVER_USER: $DEV_SERVER_USER
+
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - node_modules/
+    - .turbo/
+    - apps/*/node_modules/
+    - packages/*/node_modules/
+
+stages:
+  - prepare
+  - validate
+  - build
+  - deploy      # package와 archive를 deploy 안으로 통합
+  - notify      # 알림 추가
+
+# =====================================
+# Stage 1: 준비
+# =====================================
+install_dependencies:
+  stage: prepare
+  image: node:${NODE_VERSION}-alpine
+  script:
+    - echo "📦 Installing dependencies..."
+    - npm ci --prefer-offline --no-audit
+  artifacts:
+    paths:
+      - node_modules/
+      - apps/*/node_modules/
+      - packages/*/node_modules/
+    expire_in: 1 hour
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 2: 검증 (병렬 실행)
+# =====================================
+lint:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - npx turbo run lint
+  only:
+    - merge_requests
+    - main
+    - develop
+
+type_check:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - npx turbo run type-check
+  only:
+    - merge_requests
+    - main
+    - develop
+
+test:
+  stage: validate
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies"]
+  script:
+    - npx turbo run test -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  only:
+    - merge_requests
+    - main
+    - develop
+
+# =====================================
+# Stage 3: 빌드 (조건부 실행 강화)
+# =====================================
+build_changed:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  needs: ["install_dependencies", "lint", "type_check", "test"]
+  script:
+    - echo "🏗️ Building changed apps..."
+    # Turborepo가 변경된 앱만 자동 감지하여 빌드
+    - npx turbo run build --filter='[HEAD^1]'
+  artifacts:
+    paths:
+      - apps/*/dist/
+    expire_in: 1 day
+  only:
+    - main
+    - develop
+
+# =====================================
+# Stage 4: 배포 (병렬 실행 강화)
+# =====================================
+# 4-1. Docker 이미지 빌드 및 푸시
+docker_build:
+  stage: deploy
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  needs: ["build_changed"]
+  before_script:
+    - docker info
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "🐳 Building Docker images..."
+    - |
+      # 변경된 앱만 Docker 이미지 빌드 (dist 폴더 존재 확인)
+      for app in apps/*/; do
+        app_name=$(basename "$app")
+        if [ -d "$app/dist" ]; then
+          echo "Building $app_name..."
+          docker build \
+            --build-arg APP_NAME=$app_name \
+            --cache-from $CI_REGISTRY_IMAGE/$app_name:latest \
+            --tag $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA \
+            --tag $CI_REGISTRY_IMAGE/$app_name:latest \
+            --file docker/Dockerfile.app \
+            . && \
+          docker push $CI_REGISTRY_IMAGE/$app_name:$CI_COMMIT_SHA && \
+          docker push $CI_REGISTRY_IMAGE/$app_name:latest
+        else
+          echo "Skipping $app_name (not built)"
+        fi
+      done
+  only:
+    - main
+    - develop
+
+# 4-2. 서버 배포
+deploy_to_dev:
+  stage: deploy
+  image: alpine:latest
+  needs: ["docker_build"]
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $DEV_SERVER_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh $DEV_SERVER_USER@$DEV_SERVER_HOST << 'ENDSSH'
+        cd /opt/my-monorepo
+        docker compose pull
+        docker compose up -d --remove-orphans
+        docker image prune -af --filter "until=24h"
+      ENDSSH
+  environment:
+    name: development
+    url: https://dev.yourcompany.com
+  only:
+    - develop
+
+# 4-3. 아카이빙 (병렬 실행)
+archive_build:
+  stage: deploy
+  image: alpine:latest
+  needs: ["build_changed"]
+  before_script:
+    - apk add --no-cache git curl
+  script:
+    - mkdir -p build-artifacts/$CI_COMMIT_REF_NAME
+    - |
+      # 커밋 정보 텍스트 파일 생성
+      cat > build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt << EOF
+      ===============================================
+      Build Artifact - Pipeline #${CI_PIPELINE_ID}
+      ===============================================
+      
+      브랜치: ${CI_COMMIT_REF_NAME}
+      커밋 SHA: ${CI_COMMIT_SHA}
+      커밋 작성자: $(git log -1 --pretty=format:'%an <%ae>')
+      커밋 날짜: $(git log -1 --pretty=format:'%ci')
+      커밋 메시지: $(git log -1 --pretty=format:'%s')
+      
+      ===============================================
+      GitLab 커밋 페이지
+      ===============================================
+      ${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}
+      
+      수동 저장: 브라우저에서 열고 "다른 이름으로 저장"
+      
+      ===============================================
+      빌드된 앱 목록
+      ===============================================
+      EOF
+    - |
+      for app in apps/*/; do
+        if [ -d "$app/dist" ]; then
+          echo "- $(basename $app)" >> build-artifacts/$CI_COMMIT_REF_NAME/commit-${CI_PIPELINE_ID}.txt
+        fi
+      done
+    - |
+      # GITLAB_TOKEN이 있으면 자동 HTML 다운로드 (선택)
+      if [ -n "$GITLAB_TOKEN" ]; then
+        COMMIT_DATE=$(git log -1 --format=%cd --date=format:'%Y%m%d-%H%M' ${CI_COMMIT_SHA})
+        COMMIT_MSG=$(git log -1 --format=%s ${CI_COMMIT_SHA} | sed 's/[^a-zA-Z0-9가-힣]/-/g' | cut -c1-50)
+        COMMIT_SHORT=$(echo ${CI_COMMIT_SHA} | cut -c1-8)
+        FILENAME="${COMMIT_DATE}-${COMMIT_MSG}-${COMMIT_SHORT}.html"
+        
+        wget --header="PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+             --timeout=30 --tries=3 \
+             -O "build-artifacts/$CI_COMMIT_REF_NAME/${FILENAME}" \
+             "${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}" \
+             && echo "✅ HTML saved: ${FILENAME}" \
+             || echo "ℹ️ HTML download skipped (manual download available)"
+      fi
+    - |
+      # 클라우드 업로드 (선택)
+      if [ -n "$RCLONE_CONFIG" ]; then
+        echo "$RCLONE_CONFIG" > ~/.rclone.conf
+        apk add --no-cache rclone
+        rclone copy build-artifacts/ remote:build-artifacts/ -v || true
+      fi
+  artifacts:
+    paths:
+      - build-artifacts/
+    expire_in: 90 days
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# =====================================
+# Stage 5: 알림 (새로 추가)
+# =====================================
+notify_success:
+  stage: notify
+  image: alpine:latest
+  needs: ["deploy_to_dev"]
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        apk add --no-cache curl
+        curl -X POST $SLACK_WEBHOOK_URL \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "text": "✅ 배포 성공: '"$CI_COMMIT_MESSAGE"'",
+            "attachments": [{
+              "color": "good",
+              "fields": [
+                {"title": "브랜치", "value": "'"$CI_COMMIT_REF_NAME"'", "short": true},
+                {"title": "커밋", "value": "'"${CI_COMMIT_SHA:0:8}"'", "short": true},
+                {"title": "작성자", "value": "'"$GITLAB_USER_NAME"'", "short": true},
+                {"title": "파이프라인", "value": "<'"$CI_PIPELINE_URL"'|#'"$CI_PIPELINE_ID"'>", "short": true}
+              ]
+            }]
+          }'
+      fi
+  when: on_success
+  only:
+    - develop
+    - main
+
+notify_failure:
+  stage: notify
+  image: alpine:latest
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        apk add --no-cache curl
+        curl -X POST $SLACK_WEBHOOK_URL \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "text": "❌ 배포 실패: '"$CI_COMMIT_MESSAGE"'",
+            "attachments": [{
+              "color": "danger",
+              "fields": [
+                {"title": "브랜치", "value": "'"$CI_COMMIT_REF_NAME"'", "short": true},
+                {"title": "실패 Job", "value": "'"$CI_JOB_NAME"'", "short": true},
+                {"title": "파이프라인", "value": "<'"$CI_PIPELINE_URL"'|#'"$CI_PIPELINE_ID"'>", "short": false}
+              ]
+            }]
+          }'
+      fi
+  when: on_failure
+  only:
+    - develop
+    - main
